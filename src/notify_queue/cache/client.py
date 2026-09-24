@@ -1,7 +1,9 @@
 """Fail-open Redis wrapper.
 
-Redis (Upstash in production) is a read-side cache. Any Redis error is logged and
-treated as a cache miss, so an outage makes the API slower but never wrong.
+Redis (Upstash in production) is the rate limiter and a read-side cache. Any
+Redis error is logged and the caller's default is returned: a cache miss, or the
+Postgres rate limiter. An outage makes the service slower, never wrong about
+what was sent.
 """
 
 import asyncio

@@ -1,6 +1,7 @@
 import os
 import socket
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,7 +18,7 @@ class Settings(BaseSettings):
     db_pool_size: int = 10
     db_max_overflow: int = 20
 
-    # Redis is a read-side cache only; correctness never depends on it.
+    # Redis: rate limiter and read cache. Fail-open: never decides duplicate sends.
     redis_url: str = "redis://localhost:6390/0"
     redis_key_prefix: str = "nq:"
     redis_socket_timeout: float = 1.0
@@ -46,8 +47,11 @@ class Settings(BaseSettings):
     backoff_cap_seconds: float = 300.0
     failure_rate: float = 0.1
     rate_limit_per_hour: int = 10
-    # Fixed window length. One hour per the brief; shorten it for demos.
+    # Window length. One hour per the brief; shorten it for demos.
     rate_limit_window_seconds: float = 3600.0
+    # "redis": sliding window in Redis, falling back to Postgres if Redis is down.
+    # "postgres": fixed window in Postgres only.
+    rate_limit_backend: Literal["redis", "postgres"] = "redis"
 
     # Mock provider
     mock_latency_min: float = 0.02

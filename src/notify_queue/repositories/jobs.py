@@ -422,12 +422,13 @@ _ACQUIRE_RATE_LIMIT = text(
 
 async def try_acquire_rate_limit(
     conn: AsyncConnection, *, recipient: str, limit: int, window_seconds: float
-) -> datetime | None:
+) -> float | None:
     """Take one send from ``recipient``'s allowance for the current fixed window.
 
-    A single atomic upsert: the conditional ``DO UPDATE ... WHERE count < limit``
+    This is the Postgres limiter, used when Redis is unavailable or disabled. A
+    single atomic upsert: the conditional ``DO UPDATE ... WHERE count < limit``
     means two workers can never both take the last slot. Returns ``None`` if the
-    send is allowed, otherwise the start of the next window (when to retry).
+    send is allowed, otherwise the seconds until the next window starts.
     """
     result = await conn.execute(
         _ACQUIRE_RATE_LIMIT,
@@ -435,26 +436,28 @@ async def try_acquire_rate_limit(
     )
     if result.first() is not None:
         return None
-    next_window = await conn.scalar(
+    return await conn.scalar(
         text(
-            "SELECT to_timestamp((floor(extract(epoch FROM now()) / :window) + 1) * :window)"
+            """
+            SELECT (floor(extract(epoch FROM now()) / :window) + 1) * :window
+                   - extract(epoch FROM now())
+            """
         ).bindparams(bindparam("window", type_=Float)),
         {"window": window_seconds},
     )
-    return next_window
 
 
 async def defer_for_rate_limit(
-    conn: AsyncConnection, *, job_id: UUID, claim_token: UUID, run_at: datetime
+    conn: AsyncConnection, *, job_id: UUID, claim_token: UUID, delay_seconds: float
 ) -> Transition | None:
-    """Put a claimed job back in the queue until ``run_at`` without counting an
+    """Put a claimed job back in the queue for ``delay_seconds`` without counting an
     attempt: being rate limited is queueing, not failure."""
     result = await conn.execute(
         text(
             """
             UPDATE jobs
             SET status           = 'pending',
-                run_at           = :run_at,
+                run_at           = now() + make_interval(secs => :delay_seconds),
                 attempts         = attempts - 1,
                 claim_token      = NULL,
                 locked_by        = NULL,
@@ -465,8 +468,8 @@ async def defer_for_rate_limit(
             WHERE id = :job_id AND claim_token = :claim_token AND status = 'processing'
             RETURNING id, version, status
             """
-        ).bindparams(bindparam("run_at", type_=DateTime(timezone=True))),
-        {"job_id": job_id, "claim_token": claim_token, "run_at": run_at},
+        ).bindparams(bindparam("delay_seconds", type_=Float)),
+        {"job_id": job_id, "claim_token": claim_token, "delay_seconds": delay_seconds},
     )
     row = result.mappings().first()
     return _transition(row) if row else None

@@ -17,6 +17,7 @@ from notify_queue.cache.job_cache import JobCache
 from notify_queue.config import Settings, get_settings
 from notify_queue.db.session import create_engine
 from notify_queue.senders.mock import MockSender
+from notify_queue.services.rate_limiter import build_rate_limiter
 from notify_queue.worker.common import CacheInvalidator, sleep_or_stop
 from notify_queue.worker.loop import Worker
 from notify_queue.worker.reaper import Reaper
@@ -36,7 +37,8 @@ async def run_worker(settings: Settings, *, exit_when_idle: float | None = None)
         failure_rate=settings.failure_rate,
         latency_range=(settings.mock_latency_min, settings.mock_latency_max),
     )
-    worker = Worker(engine, sender, settings, invalidator)
+    rate_limiter = build_rate_limiter(engine, cache, settings)
+    worker = Worker(engine, sender, rate_limiter, settings, invalidator)
     stop = asyncio.Event()
 
     loop = asyncio.get_running_loop()
@@ -56,10 +58,11 @@ async def run_worker(settings: Settings, *, exit_when_idle: float | None = None)
             await sleep_or_stop(stop, 0.5)
 
     log.info(
-        "worker %s starting (%d loops, failure_rate=%.2f)",
+        "worker %s starting (%d loops, failure_rate=%.2f, rate limiter=%s)",
         worker.worker_id,
         settings.worker_concurrency,
         settings.failure_rate,
+        type(rate_limiter).__name__,
     )
     async with httpx.AsyncClient() as http:
         tasks = [

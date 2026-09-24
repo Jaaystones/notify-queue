@@ -7,8 +7,8 @@ per-recipient rate limits, retries with exponential backoff, a dead letter
 queue, and webhook callbacks on every status change.
 
 - **Stack:** Python 3.12, FastAPI, PostgreSQL 16 (the source of truth and the
-  queue), Redis/Upstash (read cache only), SQLAlchemy 2 async + asyncpg, Alembic,
-  pytest.
+  queue), Redis/Upstash (per-recipient rate limiter and read cache, with a
+  Postgres fallback), SQLAlchemy 2 async + asyncpg, Alembic, pytest.
 - **Design:** [DESIGN.md](DESIGN.md) covers the architecture, the exactly-once
   argument, and scaling.
 
@@ -75,8 +75,8 @@ useful for demos and scripts.
 
 `.env` is gitignored. Keep credentials out of `.env.example`. The test suite
 always uses the local Redis container, so it never uses your Upstash quota. If
-Redis is unreachable, the service keeps working and serves everything from
-Postgres (see DESIGN.md, section 6).
+Redis is unreachable, the service keeps working: reads come from Postgres and
+rate limiting switches to a Postgres limiter (see DESIGN.md, sections 5 and 6).
 
 ## API
 
@@ -141,6 +141,7 @@ Every setting can be given as an environment variable or in `.env`.
 | `BACKOFF_BASE_SECONDS` / `BACKOFF_CAP_SECONDS` | `2` / `300` | Exponential backoff |
 | `RATE_LIMIT_PER_HOUR` | `10` | Sends per recipient per window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `3600` | Window length (shorten it for demos) |
+| `RATE_LIMIT_BACKEND` | `redis` | `redis` (sliding window, Postgres fallback) or `postgres` (fixed window only) |
 | `WORKER_CONCURRENCY` | `4` | Claim loops per worker process |
 | `BATCH_SIZE` | `10` | Jobs claimed per loop iteration |
 | `LEASE_SECONDS` | `30` | How long a claim lasts before the reaper can take the job back |
@@ -154,11 +155,11 @@ See [config.py](src/notify_queue/config.py) for the rest.
 
 ```bash
 make up      # the tests need the Postgres and Redis containers
-make test    # 52 tests, about 90 seconds
+make test    # 62 tests, about 90 seconds
 ```
 
 The tests run against real Postgres and Redis, because the behaviour under test
-(`SKIP LOCKED`, the Lua cache script) can't be faked faithfully. They use a
+(`SKIP LOCKED`, the Lua scripts) can't be faked faithfully. They use a
 separate `notify_queue_test` database. The headline tests are:
 
 - `tests/test_concurrency.py` checks that nothing is delivered twice. It runs
@@ -169,6 +170,9 @@ separate `notify_queue_test` database. The headline tests are:
 - `tests/test_worker.py` covers backoff timing and dead-lettering, permanent
   errors, poison messages, rate-limit deferral, priority order, the reaper,
   fencing a stale worker, and the crash-after-send case.
+- `tests/test_rate_limiter.py` covers the Redis sliding window: the limit,
+  sliding, a reclaimed job reusing its slot, refunds, concurrent acquires, and
+  the fallback to Postgres when Redis is down.
 - `tests/test_claim.py` checks that concurrent claimers never claim the same job,
   and that a stale claim token is rejected.
 - `tests/test_api_jobs.py` checks scheduling validation, and that 50 concurrent
@@ -181,7 +185,7 @@ separate `notify_queue_test` database. The headline tests are:
 ```
 src/notify_queue/
   api/            FastAPI app and routes
-  services/       scheduling, metrics and dead letter logic (Postgres + cache)
+  services/       scheduling, rate limiting, metrics and dead letter logic
   repositories/   all SQL. jobs.py holds the concurrency-critical statements
   worker/         claim loop, reaper, webhook dispatcher, process entry point
   senders/        Sender protocol and the mock provider

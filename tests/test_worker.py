@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -93,13 +94,18 @@ async def test_poison_message_is_retried_then_dead_lettered(engine: AsyncEngine)
     assert worker.stats["errors"] == 0  # handled as a failed attempt, not a crash
 
 
-async def test_rate_limit_defers_excess_jobs_without_failing_them(engine: AsyncEngine) -> None:
+@pytest.mark.parametrize("backend", ["redis", "postgres"])
+async def test_rate_limit_defers_excess_jobs_without_failing_them(
+    engine: AsyncEngine, backend: str
+) -> None:
     limited = await insert_jobs(engine, 5, recipient="busy@example.com")
     await insert_jobs(engine, 1, recipient="quiet@example.com")
-    settings = make_settings(failure_rate=0, rate_limit_per_hour=3, batch_size=10)
+    settings = make_settings(
+        failure_rate=0, rate_limit_per_hour=3, batch_size=10, rate_limit_backend=backend
+    )
 
     # The five busy@ jobs are processed concurrently, so this also exercises the
-    # atomicity of the counter: exactly three may win.
+    # atomicity of the limiter: exactly three may win.
     await build_worker(engine, settings).run_batch()
 
     sent = await column(engine, "SELECT recipient FROM jobs WHERE status = 'sent'")
@@ -225,3 +231,20 @@ async def test_deferred_job_is_retried_in_next_window(engine: AsyncEngine) -> No
     await worker.run_batch()
 
     assert await scalar(engine, "SELECT count(*) FROM jobs WHERE status = 'sent'") == 2
+
+
+async def test_rejected_send_refunds_its_rate_limit_slot(engine: AsyncEngine) -> None:
+    first, second = await insert_jobs(engine, 2, recipient="busy@example.com", max_attempts=3)
+    settings = make_settings(
+        failure_rate=1.0, rate_limit_per_hour=1, batch_size=1, backoff_base_seconds=600
+    )
+    worker = build_worker(engine, settings)
+
+    await worker.run_batch()  # first job takes the only slot, the provider rejects it
+    await worker.run_batch()  # the refunded slot lets the second job try
+
+    for job in (first, second):
+        stored = await fetch_job(engine, job.id)
+        assert stored.attempts == 1
+        assert stored.last_error is not None and stored.last_error.startswith("DeliveryError")
+    assert worker.stats["rate_limited"] == 0

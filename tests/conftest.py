@@ -21,6 +21,7 @@ from notify_queue.cache.client import Cache
 from notify_queue.cache.job_cache import JobCache
 from notify_queue.config import Settings
 from notify_queue.db.session import create_engine
+from tests.factories import OPEN_CACHES
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://notify:notify@localhost:5440/notify_queue_test"
@@ -51,6 +52,13 @@ def _migrate() -> None:
     cfg.set_main_option("sqlalchemy.url", TEST_DATABASE_URL)
     cfg.attributes["configure_logger"] = False
     command.upgrade(cfg, "head")
+
+
+@pytest.fixture(autouse=True)
+async def _close_worker_caches() -> AsyncIterator[None]:
+    yield
+    while OPEN_CACHES:
+        await OPEN_CACHES.pop().close()
 
 
 @pytest.fixture

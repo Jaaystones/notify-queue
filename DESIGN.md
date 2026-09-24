@@ -6,13 +6,15 @@ Notify Queue uses **PostgreSQL as both the source of truth and the queue**.
 Workers claim due jobs with `SELECT … FOR UPDATE SKIP LOCKED`. Each claim takes
 a lease and a fencing token, and every later write must present that token.
 A job's status change, its delivery record, its attempt history and its webhook
-event are written in one transaction. **Redis (Upstash) is a read-side cache
-only.** It speeds up status, idempotency and metrics reads. No correctness
-decision depends on it, and the service keeps running if Redis is down.
+event are written in one transaction. **Redis (Upstash) has two jobs.** It is
+the per-recipient **rate limiter**, a sliding window run atomically by a Lua
+script. It is also a **read cache** for status, idempotency and metrics. Redis
+never decides whether a job is claimed, sent or duplicated. If Redis is down,
+rate limiting falls back to a Postgres limiter, reads go straight to Postgres,
+and the service keeps running.
 
-The main reason for this choice is that the hard requirements (no duplicate
-sends, idempotency, rate limits that hold under concurrency) all come down to
-atomic state changes. With one transactional store, each of them is one SQL
+The main reason for this split is that the hard requirements (no duplicate
+sends, idempotency) come down to atomic state changes on the job itself. With one transactional store, each of them is one SQL
 statement whose correctness can be checked by reading that statement. The
 trade-off is throughput: section 8 covers where this design stops scaling and
 what would replace it.
@@ -32,11 +34,12 @@ flowchart LR
         D[Webhook dispatcher]
     end
 
-    L <-->|claim · rate-limit · finalize| PG
+    L <-->|claim · finalize<br/>rate-limit fallback| PG
     RP -->|reclaim expired leases| PG
     D <-->|claim outbox events| PG
     L -->|send, idempotency key = job.id| P[Provider<br/>mock]
     D -->|POST event| CB[Callback URL<br/>mock receiver]
+    L <-->|rate limit<br/>sliding window| R
     L -.->|invalidate, async| R
 ```
 
@@ -47,6 +50,7 @@ flowchart LR
 | Reaper (`worker/reaper.py`) | Returns jobs whose worker died (expired lease) to the queue, or dead-letters them at the retry cap |
 | Webhook dispatcher (`worker/webhook_dispatcher.py`) | Delivers outbox events to callback URLs, with retries |
 | Repository (`repositories/jobs.py`) | **All** concurrency-critical SQL, in one file for review |
+| Rate limiter (`services/rate_limiter.py`) | Redis sliding window per recipient, with a Postgres fixed-window fallback |
 | Mock provider (`senders/mock.py`) | Random latency and failure rate. Dedupes on the idempotency key, like SES or Twilio |
 
 Every worker process runs all three loops. They all coordinate through
@@ -61,7 +65,7 @@ stateDiagram-v2
     pending --> processing: claimed (SKIP LOCKED, lease, claim_token)
     processing --> sent: send ok
     processing --> pending: send failed, attempts left (run_at = now + backoff)
-    processing --> pending: rate limited (run_at = next window, attempt not counted)
+    processing --> pending: rate limited (run_at = when a slot frees, attempt not counted)
     processing --> pending: lease expired (reaper)
     processing --> dead_lettered: attempts exhausted, or permanent error
     dead_lettered --> pending: POST /v1/dead-letters/{id}/requeue
@@ -92,7 +96,7 @@ honest name for it.
 | 3 | A worker crashes after the provider accepted the send but before it records the result | The job is reclaimed and sent again, so the recipient gets two messages | The sender passes `job.id` as the provider's idempotency key, and the provider absorbs the repeat. `test_crash_after_send_is_not_delivered_twice` walks through this exact sequence |
 | 4 | A send times out on our side after the provider has accepted it | Same as 3: counted as a failure, retried | Same as 3. `send_timeout` (10s) is kept well under the lease (30s), so a slow send cannot also lose its claim |
 | 5 | The same request is submitted twice, possibly at the same time | Two jobs, so two sends | `idempotency_key` is `UNIQUE`, and the insert is `ON CONFLICT DO NOTHING` followed by a read of the winner. A reuse with a different body (checked by a SHA-256 request hash) returns 409. The test fires 50 identical requests at once and gets exactly one row |
-| 6 | Two workers take the last rate-limit slot at the same time | The recipient gets N+1 messages in the window | The check and the increment are one conditional upsert: `ON CONFLICT DO UPDATE SET count = count + 1 WHERE count < :limit`. Only one of the two can succeed |
+| 6 | Two workers take the last rate-limit slot at the same time | The recipient gets N+1 messages in the window | The check and the take happen in one Lua script, which Redis runs atomically, so only one of the two can succeed. The Postgres fallback does the same with one conditional upsert: `ON CONFLICT DO UPDATE SET count = count + 1 WHERE count < :limit` |
 | 7 | A slow API read writes an old job status into the cache after a worker's update | The status endpoint shows stale data until the TTL runs out | Versioned cache writes (section 6) |
 | 8 | A webhook POST succeeds but the dispatcher dies before recording it | The event is delivered twice | Delivery is at-least-once by design. Each event has a stable `event_id`, and receivers dedupe on it (the mock receiver does) |
 
@@ -134,29 +138,60 @@ changes that promise.
 
 ## 5. Rate limiting (per recipient)
 
-- **Algorithm:** a fixed window, `RATE_LIMIT_PER_HOUR` sends (default 10) per
-  recipient per `RATE_LIMIT_WINDOW_SECONDS` (default 3600). The windows are
-  aligned to the epoch, so the window start is derived from the database clock
-  and is the same for every worker.
-- **Where:** after a job is claimed and before it is sent. `try_acquire_rate_limit`
-  does the single atomic upsert described in race 6.
+**Primary: a sliding window in Redis** (`services/rate_limiter.py`). Each
+recipient has a sorted set. Each member is the id of a job holding a slot, and
+its score is when it took the slot. One Lua script, run atomically by Redis,
+does the following:
+
+1. Reads the time from Redis (`TIME`), so every worker uses the same clock.
+2. Drops members older than the window.
+3. If this job already holds a slot, admits it again without taking another.
+4. Otherwise, admits the job and records it if fewer than
+   `RATE_LIMIT_PER_HOUR` members remain.
+5. If not, returns how long until the oldest slot frees up.
+
+The defaults are 10 sends per 3600s, set by `RATE_LIMIT_PER_HOUR` and
+`RATE_LIMIT_WINDOW_SECONDS`.
+
+- **Where it runs:** after a job is claimed and before it is sent.
 - **Over the limit means queued, not failed.** The job goes back to `pending`
-  with `run_at` set to the start of the next window. Its attempt counter is
-  decremented, so being rate-limited never moves a job towards the dead letter
-  queue. No `failed` webhook is sent.
-- **Stale windows:** the reaper deletes old window counters.
+  with `run_at = now() + wait`, and the wait comes from the script. Its attempt
+  counter is decremented, so being rate-limited never moves a job towards the
+  dead letter queue. No `failed` webhook is sent.
+- **Why a sliding window:** a fixed window allows up to 2N sends across a
+  window boundary (N at 10:59, N more at 11:00). A sliding window never allows
+  more than N in any window-length period.
+- **Why the job id is the member:**
+  - A job that is reclaimed after a worker crash reuses its own slot instead of
+    taking a second one.
+  - A slot can be handed back precisely, by removing that one member.
+- **Refunds, only when nothing was delivered.** If the provider *rejected* the
+  send (`DeliveryError`, `PermanentDeliveryError`), the slot is released. On a
+  timeout or an unexpected error the slot is kept, because the message may have
+  gone out, and the promise is never to send more than N. The release happens
+  after the fenced result is recorded, and only if this worker still owns the
+  job. If the job had been reclaimed, the new owner shares the slot (same job
+  id), and releasing it early could let one extra message through.
+  `test_rejected_send_refunds_its_rate_limit_slot` covers the refund.
+
+**Fallback: a fixed window in Postgres.** If Redis is unreachable (or
+`RATE_LIMIT_BACKEND=postgres`, or the cache is disabled), the worker uses the
+earlier limiter: one atomic upsert on `rate_limit_buckets` (race 6).
+`test_falls_back_to_postgres_when_redis_is_down` covers it, and the main
+rate-limit test runs against both backends.
 
 Trade-offs I accepted:
 
-- **Bursts at window edges.** A fixed window allows up to 2N sends across a
-  window boundary. A sliding-window log or a token bucket smooths that, but
-  costs more state per recipient. For notification fatigue, the hourly cap was
-  the requirement, so fixed windows are enough.
-- **A failed send still uses a slot.** The slot is taken before the send, so a
-  send that fails still counts. In the demo, one of 14 burst jobs failed after
-  taking a slot, so only 9 were sent in that hour. The alternative (give the slot
-  back on failure) opens a window in which more than N sends can be in flight at
-  once. I chose "never over-send".
+- **Up to 2N during a Redis outage.** The two limiters don't share counts, so a
+  recipient that used N slots in Redis can get N more from Postgres in the same
+  window. I chose availability over a strict limit during an outage. The limit
+  exists to prevent notification fatigue, not for safety, and duplicate sends
+  are unaffected either way. The alternative, pausing all sends until Redis
+  returns, would turn a cache outage into a delivery outage.
+- **A Redis round trip per send.** From my machine that's about 280ms to
+  Upstash, which slows each job down but doesn't reduce throughput much,
+  because many jobs are in flight at once. Co-located, it's under a
+  millisecond.
 - **Claim, then defer.** A rate-limited job is claimed and immediately put back,
   which is wasted work when one recipient has a large backlog. At scale, I'd
   filter those recipients out in the claim query or keep a "blocked until"
@@ -169,13 +204,14 @@ Trade-offs I accepted:
 | Job status | `job:{id}` | Cache-aside with versioned writes | 30s while in flight, 24h once terminal |
 | Idempotency keys | `idem:{key}` | Written after the insert commits. A hit skips Postgres | 24h |
 | Metrics | `metrics:v1` | Short TTL. A `SET NX` lock lets only one caller rebuild it | 2s |
+| Rate limit (section 5) | `rl:{recipient}` | Sorted set, Lua sliding window | Window length |
 
-- **Correctness never depends on the cache.** Idempotency is decided by the
-  unique constraint, and the cache is only a fast path in front of it. Claims,
-  rate limits and delivery records live only in Postgres. Every Redis call goes
+- **Duplicate-send safety never depends on Redis.** Idempotency is decided by
+  the unique constraint, and the cache is only a fast path in front of it.
+  Claims and delivery records live only in Postgres. Every Redis call goes
   through a fail-open wrapper (`cache/client.py`), which turns any error or
-  timeout into a cache miss. There are tests with Redis unreachable and with the
-  cache disabled.
+  timeout into a cache miss, or into the Postgres fallback for rate limiting.
+  There are tests with Redis unreachable and with the cache disabled.
 - **The stale-write race and the fix.** Plain delete-on-update allows this
   sequence:
   1. A reader loads version 3 of a job.
@@ -195,8 +231,9 @@ Trade-offs I accepted:
   *slower* than reads that skipped the cache and went to local Postgres (about
   300ms, and most of that is the cache write that follows the read). That's why
   worker invalidations don't block delivery. The lesson for deployment is that
-  the cache only pays off when Redis runs in the same region as the API. From a
-  distant region, turn it off with `CACHE_ENABLED=false`.
+  Redis only pays off when it runs in the same region as the API and workers.
+  From a distant region, `CACHE_ENABLED=false` turns off both the cache and the
+  Redis limiter, and everything then runs on Postgres.
 
 ## 7. Retries, backoff and the dead letter queue
 
@@ -252,10 +289,11 @@ The first things to break, in the order I'd expect them to:
      `created_at` and drop old partitions.
    - Tune autovacuum for `jobs`.
    - The partial indexes already keep the hot indexes small.
-4. **Hot rate-limit rows.** A single very busy recipient serializes on its
-   counter row. Move the counters to Redis (a Lua token bucket) and accept that
-   Redis then *is* on the correctness path, with a fallback policy for when it's
-   down.
+4. **Redis round trips per send.** Rate limiting is already in Redis, so a
+   hot recipient no longer serializes on a Postgres row. The next limit is one
+   Redis call per job. Co-locate Redis with the workers, use Redis Cluster
+   (recipient keys spread across shards naturally), and batch acquires per
+   claimed batch with a pipelined script.
 5. **The metrics query** scans `jobs`. The 2s cache hides this at moderate
    scale. Beyond that, maintain counters incrementally, or use estimates for
    the large buckets.
@@ -275,7 +313,7 @@ the provider idempotency key, and keep the outbox.
 |---|---|---|
 | A single Postgres instance, no replicas | Keeps the correctness argument about one serializable point | A primary with a standby. Status and metrics reads can move to a replica |
 | The mock provider stores its log in the same Postgres | Lets tests check "delivered exactly once" by querying | Real SES, Twilio and FCM clients behind the `Sender` protocol, passing `job.id` as their idempotency key |
-| Fixed-window rate limit, and a failed send uses its slot | Simplest limiter that is atomic and never over-sends (section 5) | Sliding window or token bucket, if smoothing matters |
+| During a Redis outage, the Postgres fallback limiter doesn't know about Redis's counts (up to 2N in a window) | Stays available. The limit prevents fatigue, it isn't a safety property (section 5) | Replicated Redis, so the fallback is rare, or pause sends to that recipient if the limit must be strict |
 | Strict priority, no aging | Matches the brief literally (section 4) | Aging, or per-priority quotas |
 | Reaped jobs retry immediately (no backoff) | A lease expiry already cost 30s. Simpler SQL | Backoff on reaped jobs too, if crash loops matter |
 | Idempotency keys are global and never expire in Postgres | No authentication, so there's no client to scope them to | Scope keys per API client, and expire them (for example after 24h) |
@@ -290,6 +328,7 @@ the provider idempotency key, and keep the outbox.
 | Claiming, fencing, retries, dead letters, rate-limit SQL | [`repositories/jobs.py`](src/notify_queue/repositories/jobs.py) |
 | Worker flow (claim, rate-limit check, send, record result) | [`worker/loop.py`](src/notify_queue/worker/loop.py) |
 | Crash recovery | [`worker/reaper.py`](src/notify_queue/worker/reaper.py) |
+| Rate limiter (Redis script, Postgres fallback) | [`services/rate_limiter.py`](src/notify_queue/services/rate_limiter.py) |
 | Idempotent scheduling | [`services/scheduler.py`](src/notify_queue/services/scheduler.py) |
 | Versioned cache | [`cache/job_cache.py`](src/notify_queue/cache/job_cache.py) |
 | Webhook outbox | [`repositories/webhooks.py`](src/notify_queue/repositories/webhooks.py), [`worker/webhook_dispatcher.py`](src/notify_queue/worker/webhook_dispatcher.py) |

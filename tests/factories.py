@@ -6,12 +6,14 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from notify_queue.cache.client import Cache
 from notify_queue.cache.job_cache import JobCache
 from notify_queue.config import Settings
 from notify_queue.domain.enums import Channel, Priority
 from notify_queue.domain.models import Job, NewJob
 from notify_queue.repositories import jobs as jobs_repo
 from notify_queue.senders.mock import MockSender
+from notify_queue.services.rate_limiter import build_rate_limiter
 from notify_queue.worker.common import CacheInvalidator
 from notify_queue.worker.loop import Worker
 
@@ -57,10 +59,25 @@ def build_worker(
     worker_id: str = "worker-test",
     rng: random.Random | None = None,
 ) -> Worker:
+    """A worker wired like production: rate limiting per ``settings.rate_limit_backend``
+    (Redis by default, against the local test Redis)."""
     sender = MockSender(
         engine, failure_rate=settings.failure_rate, latency_range=(0.0, 0.002), rng=rng
     )
-    return Worker(engine, sender, settings, CacheInvalidator(job_cache), worker_id=worker_id)
+    cache = Cache.from_settings(settings)
+    OPEN_CACHES.append(cache)
+    return Worker(
+        engine,
+        sender,
+        build_rate_limiter(engine, cache, settings),
+        settings,
+        CacheInvalidator(job_cache),
+        worker_id=worker_id,
+    )
+
+
+# Caches created by build_worker; closed after each test by conftest.
+OPEN_CACHES: list[Cache] = []
 
 
 async def make_all_due(engine: AsyncEngine) -> None:

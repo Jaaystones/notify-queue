@@ -5,8 +5,9 @@ They coordinate only through Postgres:
 
   claim     one short transaction: FOR UPDATE SKIP LOCKED + status flip + fresh
             claim_token. Committed before any network I/O.
-  gate      atomic per-recipient counter; over the limit -> back to the queue until
-            the next window (not a failure, no attempt used).
+  gate      per-recipient rate limit (Redis sliding window, Postgres fallback);
+            over the limit -> back to the queue until a slot frees up (not a
+            failure, no attempt used).
   send      outside any transaction, bounded by send_timeout < lease.
   finalize  one transaction fenced on claim_token: status + delivery ledger +
             attempt record + webhook outbox event commit together, or not at all.
@@ -24,7 +25,8 @@ from notify_queue.config import Settings
 from notify_queue.domain.backoff import backoff_delay
 from notify_queue.domain.models import Job
 from notify_queue.repositories import jobs as jobs_repo
-from notify_queue.senders.base import PermanentDeliveryError, Sender
+from notify_queue.senders.base import DeliveryError, PermanentDeliveryError, Sender
+from notify_queue.services.rate_limiter import RateLimiter
 from notify_queue.worker.common import CacheInvalidator, sleep_or_stop
 
 log = logging.getLogger(__name__)
@@ -35,12 +37,14 @@ class Worker:
         self,
         engine: AsyncEngine,
         sender: Sender,
+        rate_limiter: RateLimiter,
         settings: Settings,
         invalidator: CacheInvalidator,
         worker_id: str | None = None,
     ) -> None:
         self._engine = engine
         self._sender = sender
+        self._rate_limiter = rate_limiter
         self._settings = settings
         self._invalidator = invalidator
         self.worker_id = worker_id or settings.worker_id
@@ -95,18 +99,12 @@ class Worker:
         assert job.claim_token is not None
         worker_id = job.locked_by or self.worker_id
 
-        async with self._engine.begin() as conn:
-            retry_at = await jobs_repo.try_acquire_rate_limit(
-                conn,
-                recipient=job.recipient,
-                limit=self._settings.rate_limit_per_hour,
-                window_seconds=self._settings.rate_limit_window_seconds,
-            )
-            if retry_at is not None:
+        retry_after = await self._rate_limiter.acquire(job)
+        if retry_after is not None:
+            async with self._engine.begin() as conn:
                 deferred = await jobs_repo.defer_for_rate_limit(
-                    conn, job_id=job.id, claim_token=job.claim_token, run_at=retry_at
+                    conn, job_id=job.id, claim_token=job.claim_token, delay_seconds=retry_after
                 )
-        if retry_at is not None:
             self.stats["rate_limited"] += 1
             if deferred is not None:
                 self._invalidator.invalidate(deferred)
@@ -114,6 +112,7 @@ class Worker:
 
         error: str | None = None
         permanent = False
+        refund_slot = False
         provider_message_id: str | None = None
         try:
             result = await asyncio.wait_for(
@@ -123,8 +122,14 @@ class Worker:
             if result.deduplicated:
                 self.stats["provider_deduplicated"] += 1
         except PermanentDeliveryError as exc:
-            error, permanent = f"PermanentDeliveryError: {exc}", True
-        except Exception as exc:  # timeouts, provider errors, poison payloads
+            error, permanent, refund_slot = f"PermanentDeliveryError: {exc}", True, True
+        except DeliveryError as exc:
+            # The provider rejected the send, so nothing was delivered: the rate-limit
+            # slot can be refunded.
+            error, refund_slot = f"DeliveryError: {exc}", True
+        except Exception as exc:
+            # Timeouts and unexpected errors: the message may still have gone out, so
+            # the slot is kept (never risk sending more than the limit).
             error = f"{type(exc).__name__}: {exc}"
 
         async with self._engine.begin() as conn:
@@ -160,6 +165,11 @@ class Worker:
             log.warning("lost lease on job %s before finalizing; result discarded", job.id)
             return
 
+        if refund_slot:
+            # Only after recording the result while still owning the job. If the job
+            # had been reclaimed, the new owner shares this slot (same job id) and
+            # releasing it could let one extra message through.
+            await self._rate_limiter.release(job)
         self.stats[transition.status.value] += 1
         if error is not None:
             self.stats["failed_attempts"] += 1
