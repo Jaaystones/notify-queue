@@ -115,7 +115,7 @@ async def get_job_attempts(conn: AsyncConnection, job_id: UUID) -> list[JobAttem
         ),
         {"id": job_id},
     )
-    return [JobAttempt(**row) for row in result.mappings()]
+    return [JobAttempt.from_row(row) for row in result.mappings()]
 
 
 _CLAIM_DUE_JOBS = text(

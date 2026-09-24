@@ -37,6 +37,10 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 pythonpath = ["src"]
 
+[tool.pyright]
+pythonVersion = "3.12"
+extraPaths = ["."]
+
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]

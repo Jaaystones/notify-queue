@@ -43,15 +43,15 @@ flowchart LR
     L -.->|invalidate, async| R
 ```
 
-| Component | Responsibility |
-|---|---|
-| API (`api/`, `services/`) | Validates and schedules jobs (idempotent insert). Serves status, metrics and the dead letter queue. Hosts the mock webhook receiver |
-| Claim loop (`worker/loop.py`) | Claims due jobs by priority, applies the rate limit, sends, then records the result with the claim token |
-| Reaper (`worker/reaper.py`) | Returns jobs whose worker died (expired lease) to the queue, or dead-letters them at the retry cap |
-| Webhook dispatcher (`worker/webhook_dispatcher.py`) | Delivers outbox events to callback URLs, with retries |
-| Repository (`repositories/jobs.py`) | **All** concurrency-critical SQL, in one file for review |
-| Rate limiter (`services/rate_limiter.py`) | Redis sliding window per recipient, with a Postgres fixed-window fallback |
-| Mock provider (`senders/mock.py`) | Random latency and failure rate. Dedupes on the idempotency key, like SES or Twilio |
+| Component                                             | Responsibility                                                                                                                      |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| API (`api/`, `services/`)                         | Validates and schedules jobs (idempotent insert). Serves status, metrics and the dead letter queue. Hosts the mock webhook receiver |
+| Claim loop (`worker/loop.py`)                       | Claims due jobs by priority, applies the rate limit, sends, then records the result with the claim token                            |
+| Reaper (`worker/reaper.py`)                         | Returns jobs whose worker died (expired lease) to the queue, or dead-letters them at the retry cap                                  |
+| Webhook dispatcher (`worker/webhook_dispatcher.py`) | Delivers outbox events to callback URLs, with retries                                                                               |
+| Repository (`repositories/jobs.py`)                 | **All** concurrency-critical SQL, in one file for review                                                                      |
+| Rate limiter (`services/rate_limiter.py`)           | Redis sliding window per recipient, with a Postgres fixed-window fallback                                                           |
+| Mock provider (`senders/mock.py`)                   | Random latency and failure rate. Dedupes on the idempotency key, like SES or Twilio                                                 |
 
 Every worker process runs all three loops. They all coordinate through
 `SKIP LOCKED`, so there is no leader, no singleton reaper and no single point of
@@ -89,16 +89,16 @@ honest name for it.
 
 ### The race conditions, and what closes each one
 
-| # | Race | What would go wrong | How it's closed |
-|---|---|---|---|
-| 1 | Two workers poll at the same moment | A naive `SELECT … WHERE status='pending'` followed by `UPDATE` lets both read the same row, so both send | Claiming is **one statement**: a CTE with `FOR UPDATE SKIP LOCKED` feeds an `UPDATE … SET status='processing'`. A locked row is skipped, not waited on, and once committed it is no longer `pending`. See `claim_due_jobs` |
-| 2 | A worker stalls past its lease, the reaper hands the job to worker B, then A wakes up | A and B both mark it sent (two ledger rows, two webhooks), or A overwrites B's result | Every claim stamps a new `claim_token`. `mark_sent` and `mark_failed` update `WHERE id = … AND claim_token = … AND status = 'processing'`, so A's stale token matches 0 rows and A's result is discarded (**fencing**). `deliveries.job_id` is a primary key as a last backstop |
-| 3 | A worker crashes after the provider accepted the send but before it records the result | The job is reclaimed and sent again, so the recipient gets two messages | The sender passes `job.id` as the provider's idempotency key, and the provider absorbs the repeat. `test_crash_after_send_is_not_delivered_twice` walks through this exact sequence |
-| 4 | A send times out on our side after the provider has accepted it | Same as 3: counted as a failure, retried | Same as 3. `send_timeout` (10s) is kept well under the lease (30s), so a slow send cannot also lose its claim |
-| 5 | The same request is submitted twice, possibly at the same time | Two jobs, so two sends | `idempotency_key` is `UNIQUE`, and the insert is `ON CONFLICT DO NOTHING` followed by a read of the winner. A reuse with a different body (checked by a SHA-256 request hash) returns 409. The test fires 50 identical requests at once and gets exactly one row |
-| 6 | Two workers take the last rate-limit slot at the same time | The recipient gets N+1 messages in the window | The check and the take happen in one Lua script, which Redis runs atomically, so only one of the two can succeed. The Postgres fallback does the same with one conditional upsert: `ON CONFLICT DO UPDATE SET count = count + 1 WHERE count < :limit` |
-| 7 | A slow API read writes an old job status into the cache after a worker's update | The status endpoint shows stale data until the TTL runs out | Versioned cache writes (section 6) |
-| 8 | A webhook POST succeeds but the dispatcher dies before recording it | The event is delivered twice | Delivery is at-least-once by design. Each event has a stable `event_id`, and receivers dedupe on it (the mock receiver does) |
+| # | Race                                                                                   | What would go wrong                                                                                          | How it's closed                                                                                                                                                                                                                                                                                  |
+| - | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1 | Two workers poll at the same moment                                                    | A naive`SELECT … WHERE status='pending'` followed by `UPDATE` lets both read the same row, so both send | Claiming is**one statement**: a CTE with `FOR UPDATE SKIP LOCKED` feeds an `UPDATE … SET status='processing'`. A locked row is skipped, not waited on, and once committed it is no longer `pending`. See `claim_due_jobs`                                                         |
+| 2 | A worker stalls past its lease, the reaper hands the job to worker B, then A wakes up  | A and B both mark it sent (two ledger rows, two webhooks), or A overwrites B's result                        | Every claim stamps a new`claim_token`. `mark_sent` and `mark_failed` update `WHERE id = … AND claim_token = … AND status = 'processing'`, so A's stale token matches 0 rows and A's result is discarded (**fencing**). `deliveries.job_id` is a primary key as a last backstop |
+| 3 | A worker crashes after the provider accepted the send but before it records the result | The job is reclaimed and sent again, so the recipient gets two messages                                      | The sender passes`job.id` as the provider's idempotency key, and the provider absorbs the repeat. `test_crash_after_send_is_not_delivered_twice` walks through this exact sequence                                                                                                           |
+| 4 | A send times out on our side after the provider has accepted it                        | Same as 3: counted as a failure, retried                                                                     | Same as 3.`send_timeout` (10s) is kept well under the lease (30s), so a slow send cannot also lose its claim                                                                                                                                                                                   |
+| 5 | The same request is submitted twice, possibly at the same time                         | Two jobs, so two sends                                                                                       | `idempotency_key` is `UNIQUE`, and the insert is `ON CONFLICT DO NOTHING` followed by a read of the winner. A reuse with a different body (checked by a SHA-256 request hash) returns 409. The test fires 50 identical requests at once and gets exactly one row                           |
+| 6 | Two workers take the last rate-limit slot at the same time                             | The recipient gets N+1 messages in the window                                                                | The check and the take happen in one Lua script, which Redis runs atomically, so only one of the two can succeed. The Postgres fallback does the same with one conditional upsert:`ON CONFLICT DO UPDATE SET count = count + 1 WHERE count < :limit`                                           |
+| 7 | A slow API read writes an old job status into the cache after a worker's update        | The status endpoint shows stale data until the TTL runs out                                                  | Versioned cache writes (section 6)                                                                                                                                                                                                                                                               |
+| 8 | A webhook POST succeeds but the dispatcher dies before recording it                    | The event is delivered twice                                                                                 | Delivery is at-least-once by design. Each event has a stable`event_id`, and receivers dedupe on it (the mock receiver does)                                                                                                                                                                    |
 
 Transactions are also kept short on purpose. The claim commits *before* any
 network I/O, so no row lock is held while the provider is called. The result
@@ -122,8 +122,7 @@ was duplicated.
 - The claim query orders by `priority DESC, run_at ASC`. Among due jobs the
   highest priority goes first, and within one priority the job that has been
   due longest goes first.
-- A partial index `ix_jobs_due ON jobs (priority DESC, run_at) WHERE status =
-  'pending'` matches that order. It only contains pending rows, so it stays
+- A partial index `ix_jobs_due ON jobs (priority DESC, run_at) WHERE status = 'pending'` matches that order. It only contains pending rows, so it stays
   small however many sent jobs build up.
 - Only **due** jobs compete. A high-priority job scheduled for tomorrow does not
   block a low-priority job that is due now.
@@ -199,12 +198,12 @@ Trade-offs I accepted:
 
 ## 6. Caching with Redis (Upstash)
 
-| What | Key | Pattern | TTL |
-|---|---|---|---|
-| Job status | `job:{id}` | Cache-aside with versioned writes | 30s while in flight, 24h once terminal |
-| Idempotency keys | `idem:{key}` | Written after the insert commits. A hit skips Postgres | 24h |
-| Metrics | `metrics:v1` | Short TTL. A `SET NX` lock lets only one caller rebuild it | 2s |
-| Rate limit (section 5) | `rl:{recipient}` | Sorted set, Lua sliding window | Window length |
+| What                   | Key                | Pattern                                                     | TTL                                    |
+| ---------------------- | ------------------ | ----------------------------------------------------------- | -------------------------------------- |
+| Job status             | `job:{id}`       | Cache-aside with versioned writes                           | 30s while in flight, 24h once terminal |
+| Idempotency keys       | `idem:{key}`     | Written after the insert commits. A hit skips Postgres      | 24h                                    |
+| Metrics                | `metrics:v1`     | Short TTL. A`SET NX` lock lets only one caller rebuild it | 2s                                     |
+| Rate limit (section 5) | `rl:{recipient}` | Sorted set, Lua sliding window                              | Window length                          |
 
 - **Duplicate-send safety never depends on Redis.** Idempotency is decided by
   the unique constraint, and the cache is only a fast path in front of it.
@@ -214,6 +213,7 @@ Trade-offs I accepted:
   There are tests with Redis unreachable and with the cache disabled.
 - **The stale-write race and the fix.** Plain delete-on-update allows this
   sequence:
+
   1. A reader loads version 3 of a job.
   2. A worker commits version 4 and deletes the key.
   3. The reader writes version 3 back into the cache.
@@ -237,8 +237,7 @@ Trade-offs I accepted:
 
 ## 7. Retries, backoff and the dead letter queue
 
-- **Backoff:** exponential with equal jitter. Let `ceiling = min(cap, base ·
-  2^(attempt−1))`. The delay is uniform in `[ceiling/2, ceiling]`. With the
+- **Backoff:** exponential with equal jitter. Let `ceiling = min(cap, base · 2^(attempt−1))`. The delay is uniform in `[ceiling/2, ceiling]`. With the
   defaults (base 2s, cap 300s), attempts 1–4 wait 1–2s, 2–4s, 4–8s and 8–16s.
   The half-ceiling floor guarantees the delay really grows. The random half
   spreads out jobs that failed together, such as during a provider outage, so
@@ -309,27 +308,27 @@ the provider idempotency key, and keep the outbox.
 
 ## 9. Simplifying assumptions, and why
 
-| Assumption | Why | What production needs |
-|---|---|---|
-| A single Postgres instance, no replicas | Keeps the correctness argument about one serializable point | A primary with a standby. Status and metrics reads can move to a replica |
-| The mock provider stores its log in the same Postgres | Lets tests check "delivered exactly once" by querying | Real SES, Twilio and FCM clients behind the `Sender` protocol, passing `job.id` as their idempotency key |
-| During a Redis outage, the Postgres fallback limiter doesn't know about Redis's counts (up to 2N in a window) | Stays available. The limit prevents fatigue, it isn't a safety property (section 5) | Replicated Redis, so the fallback is rare, or pause sends to that recipient if the limit must be strict |
-| Strict priority, no aging | Matches the brief literally (section 4) | Aging, or per-priority quotas |
-| Reaped jobs retry immediately (no backoff) | A lease expiry already cost 30s. Simpler SQL | Backoff on reaped jobs too, if crash loops matter |
-| Idempotency keys are global and never expire in Postgres | No authentication, so there's no client to scope them to | Scope keys per API client, and expire them (for example after 24h) |
-| No authentication and no webhook signing | Out of scope for the exercise | API keys or OAuth, and HMAC-signed webhook bodies with a timestamp |
-| `run_at` comes from the database clock (`now()`), but `send_at` is checked against the API clock with 5s of grace | Avoids clock skew between workers, since only one clock decides what's due | Unchanged |
-| Payloads are free-form JSON per channel | The brief doesn't define templates | A schema per channel, plus templating |
+| Assumption                                                                                                              | Why                                                                                 | What production needs                                                                                       |
+| ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| A single Postgres instance, no replicas                                                                                 | Keeps the correctness argument about one serializable point                         | A primary with a standby. Status and metrics reads can move to a replica                                    |
+| The mock provider stores its log in the same Postgres                                                                   | Lets tests check "delivered exactly once" by querying                               | Real SES, Twilio and FCM clients behind the`Sender` protocol, passing `job.id` as their idempotency key |
+| During a Redis outage, the Postgres fallback limiter doesn't know about Redis's counts (up to 2N in a window)           | Stays available. The limit prevents fatigue, it isn't a safety property (section 5) | Replicated Redis, so the fallback is rare, or pause sends to that recipient if the limit must be strict     |
+| Strict priority, no aging                                                                                               | Matches the brief literally (section 4)                                             | Aging, or per-priority quotas                                                                               |
+| Reaped jobs retry immediately (no backoff)                                                                              | A lease expiry already cost 30s. Simpler SQL                                        | Backoff on reaped jobs too, if crash loops matter                                                           |
+| Idempotency keys are global and never expire in Postgres                                                                | No authentication, so there's no client to scope them to                            | Scope keys per API client, and expire them (for example after 24h)                                          |
+| No authentication and no webhook signing                                                                                | Out of scope for the exercise                                                       | API keys or OAuth, and HMAC-signed webhook bodies with a timestamp                                          |
+| `run_at` comes from the database clock (`now()`), but `send_at` is checked against the API clock with 5s of grace | Avoids clock skew between workers, since only one clock decides what's due          | Unchanged                                                                                                   |
+| Payloads are free-form JSON per channel                                                                                 | The brief doesn't define templates                                                  | A schema per channel, plus templating                                                                       |
 
 ## 10. Where to look in the code
 
-| Topic | File |
-|---|---|
-| Claiming, fencing, retries, dead letters, rate-limit SQL | [`repositories/jobs.py`](src/notify_queue/repositories/jobs.py) |
-| Worker flow (claim, rate-limit check, send, record result) | [`worker/loop.py`](src/notify_queue/worker/loop.py) |
-| Crash recovery | [`worker/reaper.py`](src/notify_queue/worker/reaper.py) |
-| Rate limiter (Redis script, Postgres fallback) | [`services/rate_limiter.py`](src/notify_queue/services/rate_limiter.py) |
-| Idempotent scheduling | [`services/scheduler.py`](src/notify_queue/services/scheduler.py) |
-| Versioned cache | [`cache/job_cache.py`](src/notify_queue/cache/job_cache.py) |
-| Webhook outbox | [`repositories/webhooks.py`](src/notify_queue/repositories/webhooks.py), [`worker/webhook_dispatcher.py`](src/notify_queue/worker/webhook_dispatcher.py) |
-| Schema and indexes | [`migrations/versions/0001_initial.py`](migrations/versions/0001_initial.py) |
+| Topic                                                      | File                                                                                                                                                       |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claiming, fencing, retries, dead letters, rate-limit SQL   | [`repositories/jobs.py`](src/notify_queue/repositories/jobs.py)                                                                                           |
+| Worker flow (claim, rate-limit check, send, record result) | [`worker/loop.py`](src/notify_queue/worker/loop.py)                                                                                                       |
+| Crash recovery                                             | [`worker/reaper.py`](src/notify_queue/worker/reaper.py)                                                                                                   |
+| Rate limiter (Redis script, Postgres fallback)             | [`services/rate_limiter.py`](src/notify_queue/services/rate_limiter.py)                                                                                   |
+| Idempotent scheduling                                      | [`services/scheduler.py`](src/notify_queue/services/scheduler.py)                                                                                         |
+| Versioned cache                                            | [`cache/job_cache.py`](src/notify_queue/cache/job_cache.py)                                                                                               |
+| Webhook outbox                                             | [`repositories/webhooks.py`](src/notify_queue/repositories/webhooks.py), [`worker/webhook_dispatcher.py`](src/notify_queue/worker/webhook_dispatcher.py) |
+| Schema and indexes                                         | [`migrations/versions/0001_initial.py`](migrations/versions/0001_initial.py)                                                                              |

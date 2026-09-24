@@ -47,8 +47,6 @@ local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
 return {0, tonumber(oldest[2]) + window - now}
 """
 
-_UNAVAILABLE = object()
-
 
 class RateLimiter(Protocol):
     async def acquire(self, job: Job) -> float | None:
@@ -97,20 +95,21 @@ class RedisRateLimiter:
 
     async def acquire(self, job: Job) -> float | None:
         script = self._acquire
-        result = await self._cache.call(
+        # The script always returns a list, so None can only mean Redis was unreachable.
+        result: list[int] | None = await self._cache.call(
             "rate limit acquire",
             lambda r: script(
                 keys=[self._key(job.recipient)],
                 args=[self._window_ms, self._settings.rate_limit_per_hour, str(job.id)],
                 client=r,
             ),
-            _UNAVAILABLE,
+            None,
         )
-        if result is _UNAVAILABLE:
+        if result is None:
             log.warning("Redis unavailable; rate limiting %s with Postgres", job.recipient)
             return await self._fallback.acquire(job)
         admitted, wait_ms = result
-        return None if admitted else max(int(wait_ms), 1) / 1000
+        return None if admitted else max(wait_ms, 1) / 1000
 
     async def release(self, job: Job) -> None:
         await self._cache.call(
