@@ -1,16 +1,21 @@
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from notify_queue.cache.job_cache import JobCache
+from notify_queue.config import Settings
 from notify_queue.domain.enums import JobStatus, Priority
+from notify_queue.domain.models import Job
 from notify_queue.domain.schemas import JobOut
 from notify_queue.repositories import jobs as jobs_repo
 from notify_queue.senders.mock import MockSender
 from notify_queue.worker.common import CacheInvalidator
+from notify_queue.worker.loop import Worker
 from notify_queue.worker.reaper import Reaper
 from tests.conftest import make_settings
 from tests.factories import (
@@ -248,3 +253,85 @@ async def test_rejected_send_refunds_its_rate_limit_slot(engine: AsyncEngine) ->
         assert stored.attempts == 1
         assert stored.last_error is not None and stored.last_error.startswith("DeliveryError")
     assert worker.stats["rate_limited"] == 0
+
+
+class _SlowRateLimiter:
+    """Admits every job, but only after ``delay`` seconds (a congested Redis or pool)."""
+
+    def __init__(self, delay: float = 0.0, error: Exception | None = None) -> None:
+        self.delay = delay
+        self.error = error
+        self.released: list[uuid.UUID] = []
+
+    async def acquire(self, job: Job) -> float | None:
+        await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return None
+
+    async def release(self, job: Job) -> None:
+        self.released.append(job.id)
+
+
+def _worker_with(engine: AsyncEngine, settings: Settings, limiter: _SlowRateLimiter) -> Worker:
+    sender = MockSender(engine, failure_rate=0, latency_range=(0.0, 0.001))
+    return Worker(engine, sender, limiter, settings, CacheInvalidator(None), worker_id="w")
+
+
+def test_settings_reject_a_lease_too_short_for_the_send_budget() -> None:
+    with pytest.raises(ValidationError, match="lease_seconds must exceed"):
+        make_settings(lease_seconds=20, send_timeout_seconds=10, db_pool_timeout=10)
+
+
+async def test_job_is_returned_unsent_when_its_lease_is_nearly_used_up(
+    engine: AsyncEngine,
+) -> None:
+    [job] = await insert_jobs(engine, 1)
+    # Budget = 0.5 + 0.5 + 0.5 = 1.5s. The limiter takes 2s of the 3s lease, leaving ~1s.
+    settings = make_settings(
+        lease_seconds=3,
+        send_timeout_seconds=0.5,
+        db_pool_timeout=0.5,
+        lease_safety_margin_seconds=0.5,
+    )
+    limiter = _SlowRateLimiter(delay=2.0)
+    worker = _worker_with(engine, settings, limiter)
+
+    await worker.run_batch()
+
+    stored = await fetch_job(engine, job.id)
+    assert stored.status == JobStatus.PENDING
+    assert stored.attempts == 0 and stored.claim_token is None
+    assert await scalar(engine, "SELECT count(*) FROM mock_provider_log") == 0
+    assert limiter.released == [job.id]
+    assert worker.stats["lease_budget_exceeded"] == 1
+
+
+async def test_job_with_enough_lease_left_is_sent(engine: AsyncEngine) -> None:
+    [job] = await insert_jobs(engine, 1)
+    settings = make_settings(
+        lease_seconds=3,
+        send_timeout_seconds=0.5,
+        db_pool_timeout=0.5,
+        lease_safety_margin_seconds=0.5,
+    )
+    worker = _worker_with(engine, settings, _SlowRateLimiter(delay=0.5))
+
+    await worker.run_batch()
+
+    assert (await fetch_job(engine, job.id)).status == JobStatus.SENT
+
+
+async def test_unexpected_error_leaves_job_for_the_reaper(engine: AsyncEngine) -> None:
+    [job] = await insert_jobs(engine, 1)
+    settings = make_settings()
+    worker = _worker_with(engine, settings, _SlowRateLimiter(error=RuntimeError("boom")))
+
+    await worker.run_batch()  # must not raise: one bad job never kills the loop
+
+    assert worker.stats["errors"] == 1
+    assert (await fetch_job(engine, job.id)).status == JobStatus.PROCESSING
+    await _expire_leases(engine)
+    [transition] = await Reaper(engine, settings, CacheInvalidator(None)).run_once()
+    assert transition.status == JobStatus.PENDING
+    assert await column(engine, "SELECT outcome FROM job_attempts") == ["lease_expired"]

@@ -79,8 +79,9 @@ as `failed`. `sent` and `dead_lettered` are the only terminal states.
 ## 3. Exactly-once delivery
 
 **What is guaranteed:** each job is recorded as delivered exactly once, and the
-system never sends it twice unless its worker loses the job mid-send. That can
-only happen through a crash, or a send that outlives the lease. In that case the
+system never sends it twice unless its worker loses the job mid-send. The lease
+budget (race 9) stops a send from outliving its lease, so that leaves a crash, or
+a process frozen mid-send for longer than the lease (for example a paused VM). In that case the
 second send carries the same provider idempotency key (`job.id`), so the
 provider does not deliver it again. End to end this is *effectively-once*: true
 exactly-once over a network to a third party is impossible without the
@@ -94,15 +95,24 @@ honest name for it.
 | 1 | Two workers poll at the same moment                                                    | A naive `SELECT … WHERE status='pending'` followed by `UPDATE` lets both read the same row, so both send | Claiming is **one statement**: a CTE with `FOR UPDATE SKIP LOCKED` feeds an `UPDATE … SET status='processing'`. A locked row is skipped, not waited on, and once committed it is no longer `pending`. See `claim_due_jobs`                                                         |
 | 2 | A worker stalls past its lease, the reaper hands the job to worker B, then A wakes up  | A and B both mark it sent (two ledger rows, two webhooks), or A overwrites B's result                        | Every claim stamps a new `claim_token`. `mark_sent` and `mark_failed` update `WHERE id = … AND claim_token = … AND status = 'processing'`, so A's stale token matches 0 rows and A's result is discarded (**fencing**). `deliveries.job_id` is a primary key as a last backstop |
 | 3 | A worker crashes after the provider accepted the send but before it records the result | The job is reclaimed and sent again, so the recipient gets two messages                                      | The sender passes `job.id` as the provider's idempotency key, and the provider absorbs the repeat. `test_crash_after_send_is_not_delivered_twice` walks through this exact sequence                                                                                                           |
-| 4 | A send times out on our side after the provider has accepted it                        | Same as 3: counted as a failure, retried                                                                     | Same as 3. `send_timeout` (10s) is kept well under the lease (30s), so a slow send cannot also lose its claim                                                                                                                                                                                   |
+| 4 | A send times out on our side after the provider has accepted it                        | Same as 3: counted as a failure, retried                                                                     | Same as 3. The lease budget (race 9) means a send only starts with enough lease left to finish and record the result, so a slow send cannot also lose its claim                                                                                                                                                                                   |
 | 5 | The same request is submitted twice, possibly at the same time                         | Two jobs, so two sends                                                                                       | `idempotency_key` is `UNIQUE`, and the insert is `ON CONFLICT DO NOTHING` followed by a read of the winner. A reuse with a different body (checked by a SHA-256 request hash) returns 409. The test fires 50 identical requests at once and gets exactly one row                           |
 | 6 | Two workers take the last rate-limit slot at the same time                             | The recipient gets N+1 messages in the window                                                                | The check and the take happen in one Lua script, which Redis runs atomically, so only one of the two can succeed. The Postgres fallback does the same with one conditional upsert: `ON CONFLICT DO UPDATE SET count = count + 1 WHERE count < :limit`                                           |
 | 7 | A slow API read writes an old job status into the cache after a worker's update        | The status endpoint shows stale data until the TTL runs out                                                  | Versioned cache writes (section 6)                                                                                                                                                                                                                                                               |
 | 8 | A webhook POST succeeds but the dispatcher dies before recording it                    | The event is delivered twice                                                                                 | Delivery is at-least-once by design. Each event has a stable `event_id`, and receivers dedupe on it (the mock receiver does)                                                                                                                                                                    |
+| 9 | A worker waits so long (for a database connection, or the rate limiter) that little of its lease is left when it starts sending | The lease expires mid-send, another worker reclaims and sends the same job, and the system has sent twice | Before sending, the worker checks the time left on its lease against a budget: `send_timeout` + `db_pool_timeout` (the longest wait for a connection to record the result) + a safety margin. Too little left means the job goes back to the queue unsent, with no attempt counted and its rate-limit slot returned. The lease clock starts before the claim query, so it can only run early. A settings validator refuses any lease shorter than the budget. `test_job_is_returned_unsent_when_its_lease_is_nearly_used_up` covers it |
 
 Transactions are also kept short on purpose. The claim commits *before* any
 network I/O, so no row lock is held while the provider is called. The result
 is recorded in a second short transaction.
+
+**The lease budget.** Fencing (race 2) guarantees a stale worker can't *record*
+a result, but on its own it can't stop a stale worker from *sending*. So every
+wait between the claim and the recorded result is bounded: 10s for the send,
+10s for a database connection, plus a 2s margin. A send only starts if the
+lease (30s) still covers all of that. The workers never extend their leases,
+which keeps the design simple: a job that runs short of time is simply put
+back unsent.
 
 ### How it's tested
 
@@ -317,6 +327,9 @@ the provider idempotency key, and keep the outbox.
 | Reaped jobs retry immediately (no backoff)                                                                              | A lease expiry already cost 30s. Simpler SQL                                        | Backoff on reaped jobs too, if crash loops matter                                                           |
 | Idempotency keys are global and never expire in Postgres                                                                | No authentication, so there's no client to scope them to                            | Scope keys per API client, and expire them (for example after 24h)                                          |
 | No authentication and no webhook signing                                                                                | Out of scope for the exercise                                                       | API keys or OAuth, and HMAC-signed webhook bodies with a timestamp                                          |
+| Callback URLs aren't restricted to public hosts | No authentication, so every caller is trusted | Block private, loopback and link-local addresses at connection time (not only when the URL is submitted, to defeat DNS rebinding), or allow-list callback hosts per client. As it stands, a caller could make the dispatcher POST to internal services (SSRF) |
+| No lease renewal (heartbeat) | The lease budget (section 3) already stops a send outliving its claim, with less machinery | Heartbeat renewal, if sends can legitimately take longer than the lease |
+| No limit on payload size | The brief doesn't define payloads | A size cap (for example 64 KB) at the API, so a large body can't bloat the jobs table |
 | `run_at` comes from the database clock (`now()`), but `send_at` is checked against the API clock with 5s of grace | Avoids clock skew between workers, since only one clock decides what's due          | Unchanged                                                                                                   |
 | Payloads are free-form JSON per channel                                                                                 | The brief doesn't define templates                                                  | A schema per channel, plus templating                                                                       |
 

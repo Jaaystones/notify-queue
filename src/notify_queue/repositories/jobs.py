@@ -447,11 +447,13 @@ async def try_acquire_rate_limit(
     )
 
 
-async def defer_for_rate_limit(
+async def return_to_queue(
     conn: AsyncConnection, *, job_id: UUID, claim_token: UUID, delay_seconds: float
 ) -> Transition | None:
     """Put a claimed job back in the queue for ``delay_seconds`` without counting an
-    attempt: being rate limited is queueing, not failure."""
+    attempt. Used when the job was never sent: it was rate limited (queueing, not
+    failure), or its lease had too little time left to send safely. Fenced on
+    ``claim_token`` like every other post-claim write."""
     result = await conn.execute(
         text(
             """

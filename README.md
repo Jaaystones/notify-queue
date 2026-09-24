@@ -145,7 +145,9 @@ Every setting can be given as an environment variable or in `.env`.
 | `WORKER_CONCURRENCY` | `4` | Claim loops per worker process |
 | `BATCH_SIZE` | `10` | Jobs claimed per loop iteration |
 | `LEASE_SECONDS` | `30` | How long a claim lasts before the reaper can take the job back |
-| `SEND_TIMEOUT_SECONDS` | `10` | Upper bound on one send (must stay below the lease) |
+| `SEND_TIMEOUT_SECONDS` | `10` | Upper bound on one send |
+| `DB_POOL_TIMEOUT` | `10` | Longest wait for a database connection |
+| `LEASE_SAFETY_MARGIN_SECONDS` | `2` | Extra time a send must leave on its lease. The lease must exceed send timeout + pool timeout + margin, or startup fails |
 | `WEBHOOK_MAX_ATTEMPTS` | `8` | Callback delivery attempts before giving up |
 | `MOCK_WEBHOOK_FAILURE_RATE` | `0` | Make the mock receiver return 503s, to show webhook retries |
 
@@ -155,7 +157,7 @@ See [config.py](src/notify_queue/config.py) for the rest.
 
 ```bash
 make up      # the tests need the Postgres and Redis containers
-make test    # 62 tests, about 90 seconds
+make test    # 66 tests, about 2 minutes
 ```
 
 The tests run against real Postgres and Redis, because the behaviour under test

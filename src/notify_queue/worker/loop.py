@@ -8,7 +8,10 @@ They coordinate only through Postgres:
   gate      per-recipient rate limit (Redis sliding window, Postgres fallback);
             over the limit -> back to the queue until a slot frees up (not a
             failure, no attempt used).
-  send      outside any transaction, bounded by send_timeout < lease.
+  budget    only send if the lease still has room for the send, a wait for a
+            connection to record the result, and a margin; otherwise put the job
+            back unsent (no attempt used), so a send never outlives its claim.
+  send      outside any transaction, bounded by send_timeout.
   finalize  one transaction fenced on claim_token: status + delivery ledger +
             attempt record + webhook outbox event commit together, or not at all.
 """
@@ -74,6 +77,10 @@ class Worker:
 
     async def run_batch(self, loop_id: str | None = None) -> int:
         """Claim and process one batch. Returns how many jobs were claimed."""
+        # Taken before the claim query is sent, so it is no later than the database's
+        # now() that starts the lease: this deadline can only be early, never late,
+        # whatever the clock difference between worker and database.
+        lease_deadline = time.monotonic() + self._settings.lease_seconds
         async with self._engine.begin() as conn:
             jobs = await jobs_repo.claim_due_jobs(
                 conn,
@@ -83,31 +90,37 @@ class Worker:
             )
         if jobs:
             self.last_activity = time.monotonic()
-            await asyncio.gather(*(self._process(job) for job in jobs))
+            await asyncio.gather(*(self._process(job, lease_deadline) for job in jobs))
         return len(jobs)
 
-    async def _process(self, job: Job) -> None:
+    async def _process(self, job: Job, lease_deadline: float) -> None:
         try:
-            await self._deliver(job)
+            await self._deliver(job, lease_deadline)
         except Exception:
             # Never let one job kill the loop. The job stays 'processing'; its lease
             # expires and the reaper returns it to the queue as a failed attempt.
             self.stats["errors"] += 1
             log.exception("unexpected error processing job %s", job.id)
 
-    async def _deliver(self, job: Job) -> None:
+    async def _deliver(self, job: Job, lease_deadline: float) -> None:
         assert job.claim_token is not None
         worker_id = job.locked_by or self.worker_id
 
         retry_after = await self._rate_limiter.acquire(job)
         if retry_after is not None:
-            async with self._engine.begin() as conn:
-                deferred = await jobs_repo.defer_for_rate_limit(
-                    conn, job_id=job.id, claim_token=job.claim_token, delay_seconds=retry_after
-                )
+            await self._return_unsent(job, delay_seconds=retry_after)
             self.stats["rate_limited"] += 1
-            if deferred is not None:
-                self._invalidator.invalidate(deferred)
+            return
+
+        if lease_deadline - time.monotonic() < self._settings.send_budget_seconds:
+            # Waiting (for a connection, or for the rate limiter) used up too much of
+            # the lease. Sending now could outlive the claim, letting another worker
+            # send the same job. Put it back unsent and give back its slot.
+            returned = await self._return_unsent(job, delay_seconds=0)
+            if returned:
+                await self._rate_limiter.release(job)
+            self.stats["lease_budget_exceeded"] += 1
+            log.warning("job %s returned unsent: too little lease left to send safely", job.id)
             return
 
         error: str | None = None
@@ -181,3 +194,16 @@ class Worker:
                 transition.status.value,
             )
         self._invalidator.invalidate(transition)
+
+    async def _return_unsent(self, job: Job, *, delay_seconds: float) -> bool:
+        """Put a claimed, unsent job back in the queue. Returns False if this worker
+        no longer owns it (its lease expired and it was reclaimed)."""
+        assert job.claim_token is not None
+        async with self._engine.begin() as conn:
+            transition = await jobs_repo.return_to_queue(
+                conn, job_id=job.id, claim_token=job.claim_token, delay_seconds=delay_seconds
+            )
+        if transition is None:
+            return False
+        self._invalidator.invalidate(transition)
+        return True
