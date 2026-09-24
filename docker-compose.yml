@@ -1,0 +1,73 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: notify
+      POSTGRES_DB: notify_queue
+    ports:
+      - "5440:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify -d notify_queue"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Local Redis for tests and offline development. The app itself points at
+  # Upstash via REDIS_URL in .env.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6390:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment: &app-env
+      # Values come from .env (compose reads it for ${...} interpolation).
+      DATABASE_URL: postgresql+asyncpg://notify:notify@db:5432/notify_queue
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-nq:}
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
+      DEFAULT_CALLBACK_URL: http://api:8000/mock/webhooks
+      FAILURE_RATE: ${FAILURE_RATE:-0.1}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+      RATE_LIMIT_PER_HOUR: ${RATE_LIMIT_PER_HOUR:-10}
+      LEASE_SECONDS: ${LEASE_SECONDS:-30}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: uvicorn notify_queue.api.main:app --host 0.0.0.0 --port 8000
+    environment: *app-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Scale with: docker compose up --scale worker=5
+  worker:
+    build: .
+    command: python -m notify_queue.worker
+    environment: *app-env
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+
+volumes:
+  pgdata:
