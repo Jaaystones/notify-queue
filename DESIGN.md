@@ -1,4 +1,3 @@
-jaystones@Jays-MacBook-Pro notify-queue %
 
 # Notify Queue: Design
 
